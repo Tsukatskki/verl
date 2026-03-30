@@ -48,6 +48,7 @@ tmp/
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
+*.whl
 
 # Unit test / coverage reports
 htmlcov/

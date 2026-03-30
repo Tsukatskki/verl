@@ -88,21 +88,34 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+    # 这里按 token 级别计算 KL 散度惩罚项。
+    # 输入是当前策略 old_log_probs 与参考策略 ref_log_prob 的对数概率。
+    # 对离散分布而言，KL 的核心形式可写为：KL(P||Q) = E_P[log P - log Q]。
+    # 在实现上，core_algos.kl_penalty(...) 会根据 kl_penalty 配置返回逐 token 的惩罚值。
     kld = core_algos.kl_penalty(
         data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
     )  # (batch_size, response_length)
+    # 仅在 response 区间上保留 KL；prompt 部分由 response_mask 置零。
     kld = kld * response_mask
+    # beta 是 KL 系数（自适应控制器当前值），用于控制“贴近参考策略”的强度。
     beta = kl_ctrl.value
 
+    # 最终 token 奖励 = 原始 token 分数 - beta * KL。
+    # KL 越大，奖励扣减越多，从而抑制策略偏离参考策略过快。
     token_level_rewards = token_level_scores - beta * kld
 
+    # 先对每个样本在序列维度做 masked mean（只统计 response token），
+    # 再在 batch 维度求平均，得到一个标量 current_kl 用于日志和自适应调参。
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    # 自适应更新 KL 控制器：当 current_kl 偏大/偏小时，后续 beta 会动态调节。
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    # 将带 KL 惩罚的 token 级奖励写回 batch，供后续 advantage 计算使用。
     data.batch["token_level_rewards"] = token_level_rewards
 
+    # 记录监控指标：当前 KL 与当前 KL 系数。
     metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
 
     return data, metrics
@@ -120,9 +133,17 @@ def compute_response_mask(data: DataProto):
     Returns:
         torch.Tensor: The attention mask for the response tokens.
     """
+    # responses 的形状通常是 [batch_size, response_len]，
+    # 这里只取第 2 维长度，得到每条样本的响应 token 数。
     responses = data.batch["responses"]
     response_length = responses.size(1)
+
+    # attention_mask 覆盖的是“整段输入”（通常是 prompt + response）。
     attention_mask = data.batch["attention_mask"]
+
+    # 约定：response 位于拼接序列的尾部，因此用切片 [:, -response_length:]
+    # 直接截取最后 response_length 列，得到仅对应 response 区间的 mask。
+    # 后续 KL、优势等计算只在该区域生效，避免把 prompt 区域混入训练信号。
     return attention_mask[:, -response_length:]
 
 
@@ -153,12 +174,21 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
-    # Back-compatible with trainers that do not compute response mask in fit
+    # 兼容旧路径：如果上游还没有提前构造 response_mask，
+    # 这里补算一次，确保后续优势函数只在 response token 上工作。
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
-    # prepare response group
+
+    # 根据配置选择不同的 advantage estimator。
+    # 所有分支最终都会把结果写回：
+    # - advantages: 策略梯度里真正使用的优势项
+    # - returns: 通常供 critic/value 学习作为回归目标
     if adv_estimator == AdvantageEstimator.GAE:
-        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+        # GAE 分支：需要 value 网络输出 values。
+        # 它会结合 token 级 reward、价值估计、gamma、lam 计算：
+        # 1) advantage
+        # 2) return
+        # 这是 PPO 中最经典的一条路径。
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
@@ -168,6 +198,9 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        # PF-PPO 的可选重加权逻辑。
+        # 如果打开，会基于配置中的重加权策略对样本重新赋权。
         if config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -175,10 +208,12 @@ def compute_advantage(
                 config.pf_ppo.get("weight_pow"),
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
+        # GRPO 分支：同样只在 response 区间做计算。
         grpo_calculation_mask = data.batch["response_mask"]
 
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
+        # GRPO 会按 uid 对同一组样本进行组内比较，
+        # 因此这里需要 non_tensor_batch["uid"] 作为分组索引。
+        # norm_adv_by_std_in_grpo 控制是否按标准差归一化优势。
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
@@ -188,37 +223,51 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
-        # handle all other adv estimator type other than GAE and GRPO
+        # 其他 estimator 统一走“函数分发”路径：
+        # 先根据 adv_estimator 找到对应实现，再按需拼装参数。
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],
             "response_mask": data.batch["response_mask"],
             "config": config,
         }
+
+        # 某些 estimator 需要按 uid 对样本分组或聚合，存在时就传入。
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
+
+        # 某些算法需要基线奖励（例如 REMAX 一类路径），存在时就附带传入。
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+
         # GDPO: pass raw data for per-dimension reward extraction
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+            # GDPO 不只依赖聚合后的 token reward，
+            # 还可能需要原始 batch / non_tensor_batch 做按维度奖励拆解。
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
-            # Check if sum_pi_squared is available
+            # 这两类 optimal baseline 需要 actor 额外提供 sum_pi_squared。
+            # 如果没算这个量，就无法构造对应的 step-dependent baseline。
             assert "sum_pi_squared" in data.batch, (
                 "Step-dependent optimal baseline requires sum_pi_squared from actor. "
                 "Please set actor.calculate_sum_pi_squared=True in config."
             )
             adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
-            # Get pre-computed rollout IS weights if available
+
+            # 如果前面已经做过 rollout correction / importance sampling，
+            # 这里会把预先计算好的 IS 权重也一起传进去。
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
-        # calculate advantage estimator
+        # 调用具体 estimator 实现，统一拿回 advantages 和 returns。
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+    # 返回写回后的 DataProto，后续 actor/critic 更新都会使用这些字段。
     return data
 
 
@@ -712,7 +761,7 @@ class RayPPOTrainer:
                 from verl.workers.engine_workers import TrainingWorkerConfig
 
                 orig_critic_cfg = critic_cfg
-                if orig_critic_cfg.strategy == "fsdp":
+                if orig_critic_cfg.strategy in {"fsdp", "fsdp2"}:
                     engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
                     engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
                     engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
@@ -763,14 +812,19 @@ class RayPPOTrainer:
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            # 对于每个资源池，创建一个 WorkerGroup，里面包含分配到该资源池的所有角色的 Worker 类。
             if not class_dict:
+                # 如果池子里没有角色，就不创建 WorkerGroup 了
                 continue
+            # 创建worker类型
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            # 绑定同种类型的worker和资源池
             wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
                 ray_cls_with_init=worker_dict_cls,
                 **wg_kwargs,
             )
+            # 收集所有worker group
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
 
@@ -1087,67 +1141,114 @@ class RayPPOTrainer:
 
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
+            # step 1: 先把训练主流程里的 DataProto 转成 tensordict。
+            # 新版 critic worker 更偏向直接消费 tensordict，因此这里先做格式适配。
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
+            # step 2: 把带 padding 的表示压缩成 no-padding 形式。
+            # 这样 critic 在做 value 前向时只处理有效 token，减少 pad token 带来的额外计算开销。
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
+            # step 3: 给 critic 补充控制信息。
+            # 这里 compute_loss=False 表示当前只做 value 推理，
+            # 不是在这一阶段直接训练 critic。
             tu.assign_non_tensor(batch_td, compute_loss=False)
+            # 调用 critic worker 对当前 batch 做一次 value 前向。
+            # 返回的是各 token 位置对应的 value 估计，后面会用于 advantage/return 计算。
             output = self.critic_wg.infer_batch(batch_td)
+            # Ray worker 返回的是异步结果句柄，这里显式取回真正输出。
             output = output.get()
+            # 从输出中取出 critic 的核心结果 values。
             values = tu.get(output, "values")
+            # 把 no-padding 的 values 还原回 padding 布局。
+            # 因为后续 response_mask、old_log_probs、ref_log_prob、token_level_rewards
+            # 都和原始 batch 的 padding 结构对齐，values 也必须保持同样布局。
             values = no_padding_2_padding(values, batch_td)
+            # 用主流程约定的字段名 values 重新打包，
+            # 再从 tensordict 转回 DataProto，方便后面直接 union 回 batch。
             values = tu.get_tensordict({"values": values.float()})
             values = DataProto.from_tensordict(values)
         else:
+            # 旧版 worker 可以直接接受 DataProto，并直接返回主流程能消费的 values 结构。
             values = self.critic_wg.compute_values(batch)
+        # 返回 critic 的 value 估计结果。
+        # 后面的 compute_advantage(...)，尤其是 GAE 分支，会直接依赖这个字段。
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
-            # step 1: convert dataproto to tensordict.
+            # step 1: 先把训练主流程里的 DataProto 转成 tensordict。
+            # 新版 worker 接口主要以 tensordict 为输入，因此这里先做格式适配。
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
+            # step 2: 把带 padding 的表示压缩成 no-padding 形式。
+            # 这样 reference policy 在前向时只处理有效 token，减少 pad token 带来的额外开销。
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
+            # step 3: 给这次 reference 前向补充控制信息。
+            # 这里不需要 entropy，也不需要在这一阶段直接构造 loss，
+            # 因此 calculate_entropy=False, compute_loss=False。
             metadata = {"calculate_entropy": False, "compute_loss": False}
             if self.ref_in_actor:
+                # 如果 reference policy 和 actor 共用同一个模型底座，
+                # 那么这里显式要求“不要启用 LoRA adapter”，
+                # 从而得到未加 adapter 的 reference policy 概率。
                 metadata["no_lora_adapter"] = True
             tu.assign_non_tensor(batch_td, **metadata)
             if self.ref_in_actor:
+                # ref_in_actor=True: 不单独调用 ref_policy_wg，
+                # 而是复用 actor worker，用 no_lora_adapter 模式算 reference log_prob。
                 output = self.actor_rollout_wg.compute_log_prob(batch_td)
             else:
+                # ref_in_actor=False: 使用独立的 reference policy worker 计算 reference log_prob。
                 output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
-            # gather output
+            # 从 worker 输出里取出 token 级 log_probs。
+            # 这些值后面会写入 ref_log_prob，并用于 KL 惩罚或 KL 相关监控。
             log_probs = tu.get(output, "log_probs")
-            # step 4. No padding to padding
+            # step 4: 把 no-padding 结果还原回 padding 布局。
+            # 后面的 old_log_probs、response_mask、values、token_level_rewards 等字段
+            # 都和原始 batch 的 padding 结构对齐，因此这里也要保持一致。
             log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
+            # step 5: 用训练主流程约定的字段名 ref_log_prob 重新打包，
+            # 再从 tensordict 转回 DataProto，方便后面直接 union 回 batch。
             ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
             ref_log_prob = DataProto.from_tensordict(ref_log_prob)
         else:
+            # 旧版实现可以直接接受 DataProto，并返回主流程能直接消费的 reference log_prob 结果。
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
+        # 返回 reference policy 的 token 级对数概率。
+        # 后面 apply_kl_penalty(...) 会把它和 old_log_probs 一起用于计算 KL 惩罚。
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-            # step 1: convert dataproto to tensordict.
+            # step 1: 先把训练主流程里的 DataProto 转成 tensordict。
+            # 新版 worker 更偏向直接消费 tensordict，因此这里先做一次格式适配。
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
+            # step 2: 再把带 padding 的表示压缩成 no-padding 表示。
+            # 这样 actor 在计算 log_prob / entropy 时只处理有效 token，避免 pad token 带来额外开销。
             batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
+            # step 3: 给 actor 补充这次前向的控制信号。
+            # calculate_entropy=True 表示除了 log_probs 还要返回 entropy；
+            # compute_loss=False 表示这里只做前向评估，不在这里直接构造训练 loss。
             tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            # 用当前 actor 对这批样本重新计算 log probability。
+            # 这里得到的是 PPO 更新前的“old policy”概率锚点，而不是 rollout 阶段顺手缓存的结果。
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
-            # gather output
+            # 从 worker 返回结果里取出需要的字段：
+            # - entropy: 后面会聚合成策略熵指标
+            # - log_probs: 后面会写入 old_log_probs
+            # - routed_experts: MoE/路由相关附加信息（如果模型有）
+            # - mfu: 推理阶段硬件利用率指标，仅用于日志
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-            # step 4. No padding to padding
+            # step 4: 把 no-padding 结果重新还原回 padding 版本。
+            # 因为后面的 response_mask、KL、advantages、loss 聚合等逻辑，
+            # 都默认这些张量和原始 batch 的 padding 布局一一对齐。
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
+            # step 5: 重新打包成训练主流程使用的字段名，
+            # 再从 tensordict 转回 DataProto，便于后面直接 union 回原 batch。
             if routed_experts is not None:
                 old_log_prob = tu.get_tensordict(
                     {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
@@ -1156,26 +1257,47 @@ class RayPPOTrainer:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            # 旧版 worker 直接接受 DataProto，并返回主流程已经能消费的 old_log_prob 结构。
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            # 旧实现没有单独暴露对应的 mfu 统计，这里用 0 占位。
             old_log_prob_mfu = 0
+        # 返回两部分：
+        # 1) old_log_prob: 真正参与后续 PPO/KL/rollout correction 计算的数据
+        # 2) old_log_prob_mfu: 仅用于性能日志记录
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        # rollout 相关配置会决定 actor 更新时使用的多轮模式、温度等元信息。
         rollout_config = self.config.actor_rollout_ref.rollout
+        # 把 multi-turn 信息写入 batch.meta_info，供 actor worker 内部更新逻辑使用。
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
+        # 这里把 rollout 温度也写进 meta_info，
+        # 方便 actor loss 侧在需要时与生成阶段保持一致的温度设定。
         batch.meta_info["temperature"] = rollout_config.temperature
-        # update actor
+        # 真正执行 actor 参数更新。
         if self.use_legacy_worker_impl == "disable":
+            # step 1: 先把训练主流程里的 DataProto 转成 tensordict。
+            # 新版 actor worker 主要以 tensordict 为输入，因此这里先做格式适配。
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
+            # step 2: 把带 padding 的表示压缩成 no-padding 形式。
+            # 这样 actor 在训练 mini-batch 时只处理有效 token，减少 pad token 的额外开销。
             batch_td = left_right_2_no_padding(batch_td)
+            # 只有当 entropy_coeff 非 0 时，actor 更新阶段才需要显式计算 entropy。
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            # 读取 actor PPO 更新相关超参数。
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            # 这里乘 rollout.n，是因为每个 prompt 在 rollout 后会扩成 n 条 response，
+            # actor 更新看到的是扩展后的样本总量。
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
+            # 把 actor 更新所需的训练控制信息写入 non-tensor metadata：
+            # - 是否计算 entropy
+            # - 全局 batch / mini-batch 大小
+            # - PPO epoch 数
+            # - 数据打乱种子与 dataloader 行为
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
@@ -1186,27 +1308,42 @@ class RayPPOTrainer:
                 dataloader_kwargs={"shuffle": shuffle},
             )
 
+            # 调用 actor worker 执行真正的 PPO policy update。
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
+            # 从 worker 输出中取回训练指标。
             actor_output = tu.get(actor_output, "metrics")
+            # 统一给 actor 指标加上 actor/ 前缀，方便日志系统分类展示。
             actor_output = rename_dict(actor_output, "actor/")
-            # modify key name
+            # 对 MFU 指标做一次键名调整，归入统一的性能指标命名空间。
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+            # 训练主流程只需要这些 metrics，因此把结果重新包装成一个只带 meta_info 的 DataProto。
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
+            # 旧版 worker 可以直接接受 DataProto，并在内部完成 actor 更新。
             actor_output = self.actor_rollout_wg.update_actor(batch)
 
+        # 返回 actor 更新后的指标结果。
+        # 主循环后面会对这些 metrics 做 reduce，并写入日志系统。
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
+            # step 1: 先把训练主流程里的 DataProto 转成 tensordict。
+            # 新版 critic worker 主要消费 tensordict，因此这里先做一次格式适配。
             batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
+            # step 2: 把带 padding 的表示压缩成 no-padding 形式。
+            # 这样 critic 在做 value loss 训练时只处理有效 token，减少 pad token 的额外开销。
             batch_td = left_right_2_no_padding(batch_td)
+            # 读取 critic PPO 更新相关超参数。
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+            # 这里同样乘 rollout.n，因为一个 prompt 会在 rollout 后扩展成 n 条 response，
+            # critic 更新实际看到的是扩展后的样本规模。
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.critic.ppo_epochs
             seed = self.config.critic.data_loader_seed
             shuffle = self.config.critic.shuffle
+            # 把 critic 训练所需的 mini-batch / epoch / seed / shuffle 等控制信息
+            # 写入 non-tensor metadata，供 worker 内部 dataloader 和训练循环读取。
             tu.assign_non_tensor(
                 batch_td,
                 global_batch_size=ppo_mini_batch_size,
@@ -1216,15 +1353,23 @@ class RayPPOTrainer:
                 dataloader_kwargs={"shuffle": shuffle},
             )
 
+            # 调用 critic worker 执行真正的 value model mini-batch 训练。
             output = self.critic_wg.train_mini_batch(batch_td)
+            # Ray worker 返回的是异步结果句柄，这里显式取回真正输出。
             output = output.get()
+            # 训练主流程这里只关心 critic 训练产生的指标。
             output = tu.get(output, "metrics")
+            # 给 critic 指标统一加上 critic/ 前缀，方便日志分类。
             output = rename_dict(output, "critic/")
-            # modify key name
+            # 对 MFU 指标做一次键名调整，归入统一的性能指标命名空间。
             output["perf/mfu/critic"] = output.pop("critic/mfu")
+            # 训练主流程只需要这些 metrics，因此重新包装成只带 meta_info 的 DataProto。
             critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         else:
+            # 旧版 worker 可以直接接受 DataProto，并在内部完成 critic 更新。
             critic_output = self.critic_wg.update_critic(batch)
+        # 返回 critic 更新后的指标结果。
+        # 主循环后面会对这些 metrics 做 reduce，并写入日志系统。
         return critic_output
 
     def fit(self):
@@ -1234,10 +1379,12 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        # 运行时按需导入，避免模块初始化阶段引入额外依赖成本。
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
 
+        # 初始化训练日志跟踪器，把完整训练配置一并记录到后端。
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1245,36 +1392,41 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        # 先从 0 开始；如果后面成功恢复 checkpoint，会被 _load_checkpoint 改写成真实步数。
         self.global_steps = 0
 
-        # load checkpoint and update weights before doing anything
+        # 在开始任何训练逻辑前，优先恢复 checkpoint，并把 trainer 权重同步到 rollout 侧。
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
+        # 根据当前 global step 推断应该从哪个 epoch 继续。
         current_epoch = self.global_steps // len(self.train_dataloader)
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
+        # 可选地在正式训练前先跑一次验证，当前主要依赖 reward_function 做评估。
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            # 如果当前任务只想做验证，这里直接结束。
             if self.config.trainer.get("val_only", False):
                 return
 
+        # 某些调试/实验模式下可以跳过真实 rollout，改成包装后的生成逻辑。
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
-        # add tqdm
+        # 初始化训练进度条，从恢复后的步数继续显示。
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
-        # we start from step 1
+        # 主循环内部按“当前 step”工作，因此进入循环前先把 step 推进到下一个待执行步。
         self.global_steps += 1
         last_val_metrics = None
+        # 记录历史最长 step 耗时，供 ESI 临近到期时判断是否需要抢救式存 checkpoint。
         self.max_steps_duration = 0
 
+        # profiler 需要同时感知前一/当前/下一步，才能支持连续多步采样。
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1283,49 +1435,61 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # 外层按 epoch 遍历，内层按 dataloader 产出的 batch 推进训练。
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                # 某些异步 worker 有延迟执行的 finalize 回调，这里先尽量非阻塞地收尾上一轮残留工作。
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+                # metrics 用于最终日志聚合；timing_raw 用于采样各阶段耗时。
                 metrics = {}
                 timing_raw = {}
 
+                # 按当前 profiler 配置决定是否在这一步启动 profile。
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                # dataloader 给的是原始字典，这里统一转成训练主流程使用的 DataProto。
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # 温度元信息会在后续 rollout / actor 更新等环节复用。
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
+                # 为 batch 中每条样本分配唯一 uid，后续重排、分组和 advantage 关联都依赖它。
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # 从完整 batch 中提取 rollout 所需的生成输入子集。
                 gen_batch = self._get_gen_batch(batch)
 
-                # pass global_steps to trace
+                # 把当前 step 传给生成侧，方便 tracing、诊断和日志对齐。
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                # 一个 prompt 通常要采样 n 条 response，因此先在生成前把输入按 n 倍展开。
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
+                # 标记当前是否已经到达训练最后一步，后面会影响验证、存档和退出逻辑。
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # step 1: 先执行 rollout，拿到模型生成的 response 及其附带元信息。
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        # rollout 结束后让副本进入休眠，便于后续 checkpoint / 权重同步管理。
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
+                        # 合并 rollout 阶段的耗时信息，避免 timing 嵌套丢失。
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # REMAX 需要一条贪心 baseline 序列来构造 reward baseline，这里额外再生成一次。
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1337,39 +1501,40 @@ class RayPPOTrainer:
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
+                            # 如果主 batch 里还没有 RM 分数，这里补算一次，供 baseline reward 使用。
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
                                 batch_reward = self._compute_reward_colocate(batch)
                                 batch = batch.union(batch_reward)
 
-                            # Compute or extract reward for REMAX baseline
+                            # REMAX baseline 使用序列级 reward，因此把 token 级 rm_scores 聚合到序列维度。
                             reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
+                            # baseline 只需要 reward 结果，不需要把临时生成字段继续带入主训练 batch。
                             keys_to_pop = set(gen_baseline_output.batch.keys())
                             if rm_scores is not None:
                                 keys_to_pop.update(rm_scores.batch.keys())
                             batch.pop(batch_keys=list(keys_to_pop))
 
+                            # 把 baseline reward 写回 batch，供后续 advantage 计算使用。
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
+                    # step 2: 把原始样本也按 rollout.n 展开，并和生成结果按样本位对齐合并。
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # 如果 rollout 阶段没有显式给出 response_mask，这里根据序列结构补齐。
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
+                    # 可选地重排 batch，让不同 DP rank 上的有效 token 数更均衡，提升吞吐稳定性。
+                    # 这通常会改变样本顺序，但 advantage 依赖 uid，不受影响。
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
+                    # 记录每条样本的总 token 数，供后面的监控统计使用。
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    # get images_seqlens
+                    # 多模态样本额外记录 image token 的长度分布，便于性能分析。
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
                         if "image_grid_thw" not in multi_modal_input.keys():
@@ -1377,18 +1542,17 @@ class RayPPOTrainer:
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
+                        # step 3: 计算或补齐奖励模型分数。
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
+                        # 从 batch 中抽取训练真正使用的 reward tensor，以及附加诊断信息。
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
-                    # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    # step 4: 决定 old_log_probs 的来源。
+                    # bypass 模式直接复用 rollout_log_probs；
+                    # decoupled 模式则重新前向计算一次 π_old，作为 PPO 更新期的稳定锚点。
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
@@ -1402,6 +1566,10 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            # MFU: Multiply-accumulate FPU Utilization
+                            # 衡量模型前向推理阶段的硬件利用率，数值越高表示越充分利用了计算资源。
+                            # 旧版 worker 可能没有单独统计 old_log_prob 的 MFU，这里用 0 占位；
+                            # 新版 worker 则直接返回这个指标。
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1411,11 +1579,13 @@ class RayPPOTrainer:
                                 loss_agg_mode=actor_config.loss_agg_mode,
                                 loss_scale_factor=actor_config.loss_scale_factor,
                             )
+                            # 记录 old policy 前向得到的熵和推理 MFU，便于观察策略分布和性能。
                             old_log_prob_metrics = {
                                 "actor/entropy": entropy_agg.detach().item(),
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            # 熵只用于统计，不需要继续保留在训练 batch 中。
                             old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
@@ -1427,34 +1597,36 @@ class RayPPOTrainer:
                                 )
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
+                                # 如果同时保留了 rollout_log_probs，这里补充一些调试型概率差异指标。
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
 
+                    # actor 更新前，batch 中必须已经带上 old_log_probs。
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
-                        # compute reference log_prob
+                        # step 5: 如果启用了 reference policy，这里计算 reference log_prob，供 KL 项使用。
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    # step 6: 如果启用了 critic，这里补充 value 预测。
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
+                        # step 7: 把 token 级 reward 写入 batch，并准备优势计算所需的附加信息。
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
+                        # 如果配置了“把 KL 并入 reward”，这里先做 KL 惩罚，再得到最终 token_level_rewards。
+                        # 一般情况下默认是单独计算 KL 指标，不直接影响 reward，但这个选项可以让算法更紧耦合地利用 KL 惩罚信号，可能会有更稳定的训练表现。
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
@@ -1463,9 +1635,8 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # decoupled 模式下还可以进一步做 rollout correction，
+                        # 包括 IS 权重、拒绝采样和对应的 off-policy 指标。
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -1478,7 +1649,7 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
-                        # compute advantages, executed on the driver process
+                        # 最后在 driver 侧直接计算 advantage / return，避免把这类轻量逻辑分发到 worker。
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
@@ -1493,31 +1664,25 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                    # update critic
+                    # step 8: 如果启用了 critic，先更新 value model，并收集其训练指标。
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
+                    # step 9: 只有过了 critic warmup，才开始真正更新 actor。
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # 执行 actor 的 PPO 更新。
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
-                        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                        # 判断当前训练实例是否临近到期，必要时优先抢救式保存 checkpoint。
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
                             redundant_time=self.config.trainer.esi_redundant_time,
                         )
-                        # Check if the conditions for saving a checkpoint are met.
-                        # The conditions include a mandatory condition (1) and
-                        # one of the following optional conditions (2/3/4):
-                        # 1. The save frequency is set to a positive value.
-                        # 2. It's the last training step.
-                        # 3. The current step number is a multiple of the save frequency.
-                        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                        # 满足保存频率、最后一步或实例临期等条件时，就在 actor 更新后落盘 checkpoint。
                         if self.config.trainer.save_freq > 0 and (
                             is_last_step
                             or self.global_steps % self.config.trainer.save_freq == 0
@@ -1528,19 +1693,19 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
-                        # update weights from trainer to rollout
+                        # actor 更新完成后，把最新权重同步给 rollout 副本，保证下一步采样使用新策略。
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
+                    # 如果配置了 rollout 数据落盘目录，这里把本步样本和奖励信息写出去。
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
-                # validate
+                # step 10: 按测试频率或最后一步执行验证。
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
@@ -1550,6 +1715,7 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                # 根据当前/下一步 profiler 状态决定是否在这里停止采样。
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
@@ -1564,19 +1730,19 @@ class RayPPOTrainer:
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
 
+                # 维护历史最长 step 耗时，供后续 ESI 保存判断使用。
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
-                # training metrics
+                # step 11: 组织训练基础指标。
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
                     }
                 )
-                # collect metrics
+                # 收集 batch 统计、奖励拆分、时延、吞吐和方差代理等诊断指标。
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
                     for key in gdpo_reward_keys:
@@ -1587,24 +1753,23 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # compute variance proxy metrics
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                # curriculum sampler 如果存在，就在每个 batch 后根据最新训练结果更新采样策略。
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # TODO: make a canonical logger that supports various backend
+                # step 12: 把本步所有指标统一打到日志后端。
                 logger.log(data=metrics, step=self.global_steps)
 
+                # 推进进度条和全局 step，准备下一轮。
                 progress_bar.update(1)
                 self.global_steps += 1
 
+                # 某些 profile 模式下会在每步训练后额外导出显存快照。
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
@@ -1613,6 +1778,7 @@ class RayPPOTrainer:
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
 
+                # 最后一步需要确保异步收尾执行完成，并输出最终验证结果后退出。
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
@@ -1620,8 +1786,7 @@ class RayPPOTrainer:
                     progress_bar.close()
                     return
 
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
+                # 某些数据集支持 batch 级别的在线更新，这里在每步结束后通知它。
                 if hasattr(self.train_dataset, "on_batch_end"):
-                    # The dataset may be changed after each training batch
+                    # 数据集可能会根据这一批训练结果调整自身状态。
                     self.train_dataset.on_batch_end(batch=batch)

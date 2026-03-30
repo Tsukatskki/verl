@@ -210,21 +210,41 @@ class RewardLoopWorker:
         rollout_response = rollout_response.replace(self.input_tokenizer.eos_token, "")
 
         chat.append({"role": "assistant", "content": rollout_response})
+        reward_input_mode = os.getenv("VERL_REWARD_MODEL_INPUT_MODE", "auto").lower()
+        has_chat_template = bool(getattr(self.reward_model_tokenizer, "chat_template", None))
 
-        rm_prompt = self.reward_model_tokenizer.apply_chat_template(
-            chat,
-            add_generation_prompt=False,
-            tokenize=False,
-        )
+        if reward_input_mode in {"chat", "auto"} and has_chat_template:
+            rm_prompt = self.reward_model_tokenizer.apply_chat_template(
+                chat,
+                add_generation_prompt=False,
+                tokenize=False,
+            )
 
-        # llama tokenizer will add bos token by default
-        # will be removed in vllm >= 0.11.2, where we can add "add_special_tokens" = False
-        if self.reward_model_tokenizer.bos_token is not None and rm_prompt.startswith(
-            self.reward_model_tokenizer.bos_token
-        ):
-            rm_prompt = rm_prompt[len(self.reward_model_tokenizer.bos_token) :]
+            # llama tokenizer will add bos token by default
+            # will be removed in vllm >= 0.11.2, where we can add "add_special_tokens" = False
+            if self.reward_model_tokenizer.bos_token is not None and rm_prompt.startswith(
+                self.reward_model_tokenizer.bos_token
+            ):
+                rm_prompt = rm_prompt[len(self.reward_model_tokenizer.bos_token) :]
+            return rm_prompt
 
-        return rm_prompt
+        # Some discriminative reward models, such as DeBERTa classifiers, do not
+        # provide a chat template. For those models we fall back to a simple
+        # question/answer serialization that still works with classify endpoints.
+        question = None
+        extra_info = data_item.non_tensor_batch.get("extra_info")
+        if isinstance(extra_info, dict):
+            question = extra_info.get("question")
+        if question is None:
+            for message in reversed(chat[:-1]):
+                if isinstance(message, dict) and message.get("role") == "user":
+                    question = message.get("content")
+                    break
+
+        sep_token = self.reward_model_tokenizer.sep_token or self.reward_model_tokenizer.eos_token or "\n\n"
+        if reward_input_mode == "pair_newline":
+            return f"{question or ''}\n\n{rollout_response}".strip()
+        return f"{question or ''}{sep_token}{rollout_response}".strip()
 
     async def compute_score_disrm(self, data: DataProto) -> dict:
         disrm_prompt = await self._preprocess_reward_inputs(data)

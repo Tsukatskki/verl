@@ -117,4 +117,23 @@ def get_megatron_last_lr(optimizer):
     """
     Get the last learning rate from the optimizer parameter scheduler.
     """
-    return optimizer.param_groups[0]["lr"]
+    param_groups = getattr(optimizer, "param_groups", None)
+    if param_groups:
+        return param_groups[0]["lr"]
+
+    # Some Megatron optimizer wrappers can legitimately have no local param groups
+    # on a given rank. In that case, look through nested optimizers before falling
+    # back to a neutral metric value.
+    nested_optimizers = getattr(optimizer, "optimizer", None)
+    if nested_optimizers is None:
+        return 0.0
+
+    if not isinstance(nested_optimizers, (list, tuple)):
+        nested_optimizers = [nested_optimizers]
+
+    for nested_optimizer in nested_optimizers:
+        lr = get_megatron_last_lr(nested_optimizer)
+        if lr != 0.0:
+            return lr
+
+    return 0.0
